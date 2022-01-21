@@ -26,7 +26,7 @@ pub enum INodeSubtype {
     },
     Directory {
         item_count: u8,
-        inode_table_block_ptr: [u32; 8]
+        inode_table_block_ptr: u64
     }
 }
 
@@ -38,11 +38,11 @@ pub struct INode {
     pub subtype_info: INodeSubtype
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
 pub struct DirectoryFileEntry {
     #[serde(with = "BigArray")]
-    pub filename: [u8; 60],
-    pub file_inode_ptr: u32
+    pub filename: [u8; 56],
+    pub file_inode_ptr: u64
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -147,3 +147,4 @@ impl fmt::Display for FsBitmap {
         write!(f, "\n")
     }
 }
+

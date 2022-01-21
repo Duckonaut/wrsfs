@@ -4,6 +4,7 @@ use structopt::StructOpt;
 
 mod wrsfs;
 mod types;
+mod helpers;
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "wrsfs")]
