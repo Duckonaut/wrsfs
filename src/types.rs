@@ -16,26 +16,25 @@ pub const INODE_BLOCK_SIZE_DESCRIBED: u32 = BLOCK_SIZE / INODE_SIZE * INODE_SIZE
 
 pub const SMALLEST_IMAGE_SIZE: u64 = 0x100000;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum INodeSubtype {
     File {
         size: u32,
-        blocks: u8,
         direct_block_ptrs: [u32; 8],
         indirect_ptr: u32
     },
     Directory {
         item_count: u8,
-        inode_table_block_ptr: u64
+        inode_table_block: u32,
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct INode {
     pub created_time: u64,
     pub last_accessed: u64,
     pub link_count: u8,
-    pub subtype_info: INodeSubtype
+    pub subtype_info: INodeSubtype,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug)]
@@ -91,6 +90,15 @@ pub struct INodes {
     full_inodes: Vec<INodeBlock>
 }
 
+impl INode {
+    pub fn get_blocks_used(&self) -> u32 {
+        match self.subtype_info {
+            INodeSubtype::Directory { .. } => 1,
+            INodeSubtype::File { size, .. } => (size + BLOCK_SIZE - 1) / BLOCK_SIZE
+        }
+    }
+}
+
 impl Superblock {
     pub fn create(size: u64) -> Superblock {
         let bitmap_block_count = ((size + BLOCK_BITMAP_SIZE_DESCRIBED as u64 - 1) / BLOCK_BITMAP_SIZE_DESCRIBED as u64) as u32; 
@@ -128,9 +136,13 @@ impl Superblock {
 impl fmt::Display for FsBitmapBlock {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for (i, v) in (&(self.bitmap)).iter().enumerate() {
-            write!(f, "{:08b}", v)?;
+            if i % 16 == 0 {
+                write!(f, "{:#010x} ", i)?;
+            }
 
-            if i % 32 == 0 {
+            write!(f, "{:08b} ", v)?;
+
+            if (i + 1) % 16 == 0 {
                 write!(f, "\n")?;
             }
         }

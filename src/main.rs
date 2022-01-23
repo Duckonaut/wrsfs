@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, fs::OpenOptions};
 
 use structopt::StructOpt;
+use wrsfs::create_dir;
 
 mod wrsfs;
 mod types;
@@ -28,7 +29,11 @@ enum Args {
         dir: String
     },
     Info {
-        imgname: PathBuf
+        imgname: PathBuf,
+        #[structopt(short, long)]
+        usage: bool,
+        #[structopt(short, long)]
+        pointers: bool,
     },
     Debug
 }
@@ -41,7 +46,7 @@ fn main() {
         Args::Mkdir { imgname, dir } => mkdir(imgname, dir),
         Args::Cp { imgname, filename, target_filename } => cp(imgname, filename, target_filename),
         Args::Ls { imgname, dir } => ls(imgname, dir),
-        Args::Info { imgname } => info(imgname),
+        Args::Info { imgname, usage, pointers } => info(imgname, usage, pointers),
         Args::Debug => debug(),
     }
 }
@@ -60,15 +65,28 @@ fn mkfs(name: PathBuf, size: u64) {
     println!("{} created with size {}", displayed, size);
 }
 
-fn info(imgname: PathBuf) {
-    match wrsfs::info(imgname) {
+fn info(imgname: PathBuf, usage: bool, ptrs: bool) {
+    match wrsfs::info(imgname, usage, ptrs) {
         Ok(()) => (),
         Err(why) => println!("Error getting info: {}", why)
     }
 }
 
-fn mkdir(imgname: PathBuf, dir: String) { 
-    println!("{:?} {}", imgname, dir);
+fn mkdir(imgname: PathBuf, dir: String) {
+    let path = imgname.as_path();
+
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", path.to_str().unwrap(), why);
+            return;
+        }
+    };
+
+    match create_dir(&mut file, &dir) {
+        Ok(_) => println!("Created dir {}", dir),
+        Err(why) => println!("mkdir failed: {}", why)
+    };
 }
 
 fn cp(imgname: PathBuf, filename: PathBuf, target_filename: String) {
@@ -80,16 +98,13 @@ fn ls(imgname: PathBuf, dir: String) {
 }
 
 fn debug() {
-    println!("{}", std::mem::size_of::<types::Superblock>());
+    let bytes = [b'\\', 0, 0, 0];
+    println!("{:?}", bytes);
 
-    println!("{}", std::mem::size_of::<types::INode>());
+    let str_from_bytes = helpers::get_string_from_array(&bytes); 
 
-    println!("{}", std::mem::size_of::<types::INodeBlock>());
+    println!("{}", str_from_bytes.len());
 
-    println!("{}", std::mem::size_of::<types::FsBitmapBlock>());
-
-    println!("{}", std::mem::size_of::<types::FsBitmap>());
-
-    println!("{}", std::mem::size_of::<types::DirectoryBlock>());
+    println!("{}", str_from_bytes);
 }
 
