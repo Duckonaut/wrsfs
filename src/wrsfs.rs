@@ -1,8 +1,8 @@
-use std::{str, fs::{File, OpenOptions}, path::PathBuf, time::{UNIX_EPOCH, Duration, SystemTime}, os::unix::prelude::FileExt, io::{Read, BufRead}};
+use std::{str, fs::{File, OpenOptions}, path::PathBuf, time::{UNIX_EPOCH, Duration}, os::unix::prelude::FileExt};
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 
-use crate::{types::{self, Superblock, SMALLEST_IMAGE_SIZE, BLOCK_SIZE, DirectoryBlock, DirectoryFileEntry, INode, INODE_SIZE, FsBitmapBlock, BLOCK_BITMAP_SIZE_DESCRIBED}, helpers};
+use crate::{types::{self, Superblock, SMALLEST_IMAGE_SIZE, BLOCK_SIZE, DirectoryBlock, DirectoryFileEntry, INode, INodeSubtype, INODE_SIZE, FsBitmapBlock, BLOCK_BITMAP_SIZE_DESCRIBED}, helpers};
 use crate::helpers::get_current_timestamp;
 
 
@@ -128,7 +128,10 @@ pub fn find_free_blocks(file: &mut File, block_count: u32) -> Result<u64, String
     let mut free_blocks_ptr: u64 = 0;
 
     'block_loop: for i in 0..bitmap_block_count {
-        file.read_exact_at(&mut block_bitmap_bytes, superblock.block_bitmap_ptr + i * BLOCK_SIZE as u64);
+        match file.read_exact_at(&mut block_bitmap_bytes, superblock.block_bitmap_ptr + i * BLOCK_SIZE as u64) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed to read block bitmap: {}", why))
+        }
 
         let mut count = 0u32;
         
@@ -178,7 +181,7 @@ pub fn find_free_inode(file: &mut File) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't read inode bitmap: {}", why))
         }
 
-        let ptr = 0usize;
+        let mut ptr = 0usize;
         for byte in block_bitmap_bytes {
             let mut mask = 0x80u8;
 
@@ -189,6 +192,7 @@ pub fn find_free_inode(file: &mut File) -> Result<u64, String> {
                 }
 
                 mask /= 2;
+                ptr += 1;
             }
         }
     }
@@ -298,6 +302,8 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     let free_blocks_for_dir = find_free_blocks(file, 1)?;
     
     let inode_ptr = find_free_inode(file)?;
+
+    dbg!(&inode_ptr);
     
     let superblock = get_superblock(file)?;
     
@@ -410,28 +416,36 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
 
         dir_block.file_entries[1] = DirectoryFileEntry {
             filename: dot_dot_bytes,
-            file_inode_ptr: inode_ptr,
+            file_inode_ptr: parent_folder,
         };
 
         let mut parent_folder_inode = get_inode(file, parent_folder)?;
+        
+        dbg!(&parent_folder_inode);
+
         parent_folder_inode.link_count += 1;
         parent_folder_inode.last_accessed = helpers::get_current_timestamp();
 
         match parent_folder_inode.subtype_info {
             types::INodeSubtype::File { .. } => return Err(format!("{} is a file!", parent_path)),
-            types::INodeSubtype::Directory { mut item_count, inode_table_block } => {
-                item_count += 1;
+            types::INodeSubtype::Directory { ref mut item_count, inode_table_block } => {
                 let file_entry_address = superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64;
 
-                dbg!(&file_entry_address);
-
-
                 let mut parent_file_entries = get_file_struct::<DirectoryBlock, 0x1000>(file, file_entry_address)?;
-                parent_file_entries.file_entries[item_count as usize] = DirectoryFileEntry {
+
+                for entry in parent_file_entries.file_entries {
+                    if entry.filename == filename_bytes {
+                        return Err(format!("Directory/file {} already exists in {}", dir_name, parent_path));
+                    }
+                }
+
+                parent_file_entries.file_entries[*item_count as usize] = DirectoryFileEntry {
                     filename: filename_bytes,
-                    file_inode_ptr: free_blocks_for_dir
+                    file_inode_ptr: inode_ptr
                 };
 
+                *item_count += 1;
+                
                 match file.write_all_at(&(match bincode::serialize(&parent_file_entries) {
                         Ok(b) => b,
                         Err(why) => return Err(format!("Couldn't serialize dir block: {}", why))
@@ -442,6 +456,8 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             }
         };
 
+        dbg!(&parent_folder_inode);
+
         match file.write_all_at(&(match bincode::serialize(&parent_folder_inode) {
                 Ok(b) => b,
                 Err(why) => return Err(format!("Couldn't serialize parent inode: {}", why))
@@ -450,6 +466,7 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write parent inode: {}", why)),
         }
 
+        dbg!(&inode_ptr);
 
         match file.write_all_at(&(match bincode::serialize(&inode) {
                 Ok(b) => b,
@@ -458,6 +475,8 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Ok(()) => (),
             Err(why) => return Err(format!("Couldn't write inode: {}", why)),
         }
+
+        dbg!(&free_blocks_for_dir);
 
         match file.write_all_at(&(match bincode::serialize(&dir_block) {
                 Ok(b) => b,
@@ -475,6 +494,47 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     }
 
     Ok(free_blocks_for_dir)
+}
+
+pub fn list(file: &mut File, dir: &String) -> Result<(), String> {
+    let superblock = get_superblock(file)?;
+    
+    let dir = String::from(dir.trim_matches('/'));
+    let dir_address = if dir == "" || dir == "/" { 
+        superblock.inode_blocks_ptr
+    }
+    else {
+        match find_folder_inode(file, &dir)? {
+            None => return Err(format!("Item {} is not a directory.", &dir)),
+            Some(dir_address) => dir_address
+        }
+    };
+
+    let dir_inode = get_inode(file, dir_address)?;
+
+    let (block_address, item_count) = match dir_inode.subtype_info {
+        INodeSubtype::File { .. } => return Err(format!("{} is a file!", dir)),
+        INodeSubtype::Directory { item_count, inode_table_block } => (inode_table_block, item_count)
+    };
+
+    let dir_block = get_file_struct::<DirectoryBlock, 0x1000>(file, superblock.blocks_ptr + block_address as u64 * BLOCK_SIZE as u64)?;
+    
+    println!("Contents of {}:", &dir);
+
+    for i in 0..item_count {
+        let item = dir_block.file_entries[i as usize];
+        let name = helpers::get_string_from_array(&item.filename);
+        let item_inode = get_inode(file, item.file_inode_ptr)?;
+
+        let data = match item_inode.subtype_info {
+            INodeSubtype::File { size, ..  } => format!("File\tSize: {}\tBlocks used: {}", size, item_inode.get_blocks_used()),
+            INodeSubtype::Directory { item_count, .. } => format!("Directory\tItem count: {}", item_count)
+        };
+
+        println!("{}\t\t{}", name, data);
+    }
+
+    Ok(())
 }
 
 fn get_superblock(file: &mut File) -> Result<Superblock, String> {
@@ -518,7 +578,6 @@ fn find_folder_inode(file: &mut File, path: &String) -> Result<Option<u64>, Stri
             types::INodeSubtype::File { .. } => return Err(format!("Expected directory inode, found file inode.")),
             types::INodeSubtype::Directory { item_count, inode_table_block } => {
                 let dir_block = get_file_struct::<DirectoryBlock, 0x1000>(file, superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64)?;
-                
                 let mut dir_exists = false;
 
                 for i in 0..item_count {

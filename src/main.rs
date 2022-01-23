@@ -1,7 +1,7 @@
 use std::{path::PathBuf, fs::OpenOptions};
 
 use structopt::StructOpt;
-use wrsfs::create_dir;
+use wrsfs::{create_dir, list};
 
 mod wrsfs;
 mod types;
@@ -94,7 +94,20 @@ fn cp(imgname: PathBuf, filename: PathBuf, target_filename: String) {
 }
 
 fn ls(imgname: PathBuf, dir: String) {
-    println!("{:?} {}", imgname, dir);
+    let path = imgname.as_path();
+
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", path.to_str().unwrap(), why);
+            return;
+        }
+    };
+
+    match list(&mut file, &dir) {
+        Ok(()) => (),
+        Err(why) => println!("Error getting list: {}", why)
+    }
 }
 
 fn debug() {
