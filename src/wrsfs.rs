@@ -303,7 +303,7 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     
     let inode_ptr = find_free_inode(file)?;
 
-    dbg!(&inode_ptr);
+    set_inode_used(file, inode_ptr)?;
     
     let superblock = get_superblock(file)?;
     
@@ -349,7 +349,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write directory block: {}", why)),
         }
 
-        set_inode_used(file, inode_ptr)?;
         set_blocks_used(file, free_blocks_for_dir, 1)?;
 
         update_superblock(file)?;
@@ -375,8 +374,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
         let path_parts = dir.split("/").collect::<Vec<&str>>();
         let parent_path = path_parts[0..(path_parts.len()-1)].join("/");
 
-        dbg!(&parent_path);
-
         let parent_folder = if parent_path == "" {
             superblock.inode_blocks_ptr
         }
@@ -386,6 +383,9 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
                 None => create_dir(file, &parent_path)?
             }
         };
+        
+        dbg!(&parent_path);
+        dbg!(&parent_folder);
 
         let dir_name = match path_parts.last() {
             Some(v) => v.to_owned(),
@@ -476,14 +476,12 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write directory block: {}", why)),
         }
 
-        set_inode_used(file, inode_ptr)?;
         set_blocks_used(file, free_blocks_for_dir, 1)?;
 
         update_superblock(file)?;
 
     }
-
-    Ok(free_blocks_for_dir)
+    Ok(inode_ptr)
 }
 
 pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(), String> {
