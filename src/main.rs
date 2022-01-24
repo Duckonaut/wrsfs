@@ -1,7 +1,7 @@
 use std::{path::PathBuf, fs::OpenOptions};
 
 use structopt::StructOpt;
-use wrsfs::{create_dir, list};
+use wrsfs::{create_dir, list, copy_file, get_file};
 
 mod wrsfs;
 mod types;
@@ -22,6 +22,11 @@ enum Args {
         imgname: PathBuf,
         filename: PathBuf,
         target_filename: String
+    },
+    Get {
+        imgname: PathBuf,
+        filename: String,
+        target_filename: PathBuf
     },
     Ls {
         imgname: PathBuf,
@@ -45,6 +50,7 @@ fn main() {
         Args::Mkfs { name, size } => mkfs(name, size),
         Args::Mkdir { imgname, dir } => mkdir(imgname, dir),
         Args::Cp { imgname, filename, target_filename } => cp(imgname, filename, target_filename),
+        Args::Get { imgname, filename, target_filename } => get(imgname, filename, target_filename),
         Args::Ls { imgname, dir } => ls(imgname, dir),
         Args::Info { imgname, usage, pointers } => info(imgname, usage, pointers),
         Args::Debug => debug(),
@@ -90,8 +96,49 @@ fn mkdir(imgname: PathBuf, dir: String) {
 }
 
 fn cp(imgname: PathBuf, filename: PathBuf, target_filename: String) {
-    println!("{:?} {:?} {}", imgname, filename, target_filename);
+    let img_path = imgname.as_path();
+
+    let mut img_file = match OpenOptions::new().read(true).write(true).open(img_path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", img_path.to_str().unwrap(), why);
+            return;
+        }
+    };
+    
+    let path = filename.as_path();
+
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", path.to_str().unwrap(), why);
+            return;
+        }
+    };
+
+    match copy_file(&mut img_file, &mut file, &target_filename) {
+        Ok(()) => println!("Created file {}", &target_filename),
+        Err(why) => println!("Failed to create file: {}", why)
+    }
 }
+
+fn get(imgname: PathBuf, filename: String, target_filename: PathBuf) {
+    let img_path = imgname.as_path();
+
+    let mut img_file = match OpenOptions::new().read(true).write(true).open(img_path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", img_path.to_str().unwrap(), why);
+            return;
+        }
+    };
+    
+    match get_file(&mut img_file, &target_filename, &filename) {
+        Ok(()) => println!("Extracted file {}", &filename),
+        Err(why) => println!("Failed to get file: {}", why)
+    }
+}
+
 
 fn ls(imgname: PathBuf, dir: String) {
     let path = imgname.as_path();

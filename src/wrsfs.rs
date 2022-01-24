@@ -1,8 +1,8 @@
-use std::{str, fs::{File, OpenOptions}, path::PathBuf, time::{UNIX_EPOCH, Duration}, os::unix::prelude::FileExt};
+use std::{str, fs::{File, OpenOptions}, path::PathBuf, time::{UNIX_EPOCH, Duration}, os::unix::prelude::FileExt, io::{Read, Write}};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 
-use crate::{types::{self, Superblock, SMALLEST_IMAGE_SIZE, BLOCK_SIZE, DirectoryBlock, DirectoryFileEntry, INode, INodeSubtype, INODE_SIZE, FsBitmapBlock, BLOCK_BITMAP_SIZE_DESCRIBED}, helpers};
+use crate::{types::{self, Superblock, SMALLEST_IMAGE_SIZE, BLOCK_SIZE, DirectoryBlock, DirectoryFileEntry, INode, INodeSubtype, INODE_SIZE, FsBitmapBlock, BLOCK_BITMAP_SIZE_DESCRIBED, FileFirstIndirectBlock, FileSecondIndirectBlock}, helpers};
 use crate::helpers::get_current_timestamp;
 
 
@@ -387,8 +387,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             }
         };
 
-        dbg!(&parent_folder);
-
         let dir_name = match path_parts.last() {
             Some(v) => v.to_owned(),
             None => return Err(format!("The path {} is invalid", dir))
@@ -421,8 +419,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
 
         let mut parent_folder_inode = get_inode(file, parent_folder)?;
         
-        dbg!(&parent_folder_inode);
-
         parent_folder_inode.link_count += 1;
         parent_folder_inode.last_accessed = helpers::get_current_timestamp();
 
@@ -456,8 +452,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             }
         };
 
-        dbg!(&parent_folder_inode);
-
         match file.write_all_at(&(match bincode::serialize(&parent_folder_inode) {
                 Ok(b) => b,
                 Err(why) => return Err(format!("Couldn't serialize parent inode: {}", why))
@@ -466,8 +460,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write parent inode: {}", why)),
         }
 
-        dbg!(&inode_ptr);
-
         match file.write_all_at(&(match bincode::serialize(&inode) {
                 Ok(b) => b,
                 Err(why) => return Err(format!("Couldn't serialize inode: {}", why))
@@ -475,8 +467,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Ok(()) => (),
             Err(why) => return Err(format!("Couldn't write inode: {}", why)),
         }
-
-        dbg!(&free_blocks_for_dir);
 
         match file.write_all_at(&(match bincode::serialize(&dir_block) {
                 Ok(b) => b,
@@ -494,6 +484,347 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     }
 
     Ok(free_blocks_for_dir)
+}
+
+pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(), String> {
+    let superblock = get_superblock(img_file)?;
+
+    let inode_ptr = find_free_inode(img_file)?;
+   
+
+    let dir = String::from(dir.trim_matches('/'));
+    let dir_split = dir.split('/').collect::<Vec<&str>>();
+
+    let filename = match dir_split.last() {
+        Some(v) => v.to_owned(),
+        None => return Err(format!("Cannot create file with empty name \"{}\".", dir))
+    };
+
+    let parent_path = dir_split[0..(dir_split.len()-1)].join("/");
+
+    let parent_inode_address = if parent_path == "" {
+        superblock.inode_blocks_ptr
+    }
+    else {
+        match find_folder_inode(img_file, &parent_path)? {
+            Some(v) => v,
+            None => return Err(format!("Directory {} does not exist.", parent_path))
+        }
+    };
+
+    let filename_vec: Vec<u8> = String::from(filename).into_bytes();
+
+    let mut filename_bytes = [0u8; 56];
+        
+    for i in 0..(std::cmp::min(filename_vec.len(), 56)) {
+        filename_bytes[i] = filename_vec[i];
+    }
+
+    let mut dir_inode = get_inode(img_file, parent_inode_address)?;
+    
+    dir_inode.last_accessed = helpers::get_current_timestamp();
+    
+    match dir_inode.subtype_info {
+        INodeSubtype::File { .. } => return Err(format!("{} is a file, not a directory.", &parent_path)),
+        INodeSubtype::Directory { ref mut item_count, inode_table_block } => {
+            let file_entry_address = superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64;
+
+            let mut parent_file_entries = get_file_struct::<DirectoryBlock, 0x1000>(img_file, file_entry_address)?;
+            
+            for entry in parent_file_entries.file_entries {
+                if entry.filename == filename_bytes {
+                    return Err(format!("Directory/file {} already exists in {}", &filename, parent_path));
+                }
+            }
+
+            parent_file_entries.file_entries[*item_count as usize] = DirectoryFileEntry {
+                filename: filename_bytes,
+                file_inode_ptr: inode_ptr
+            };
+
+            *item_count += 1;
+                
+            match img_file.write_all_at(&(match bincode::serialize(&parent_file_entries) {
+                    Ok(b) => b,
+                    Err(why) => return Err(format!("Couldn't serialize dir block: {}", why))
+                }), file_entry_address) {
+                Ok(()) => (),
+                Err(why) => return Err(format!("Couldn't write dir block: {}", why)),
+            }
+        },
+    }
+
+    match img_file.write_all_at(&(match bincode::serialize(&dir_inode) {
+            Ok(b) => b,
+            Err(why) => return Err(format!("Couldn't serialize directory inode: {}", why))
+        }), parent_inode_address) {
+        Ok(()) => (),
+        Err(why) => return Err(format!("Couldn't write directory inode: {}", why)),
+    }
+
+
+    let file_metadata = match file.metadata() {
+        Ok(m) => m,
+        Err(why) => return Err(format!("Failed to get file metadata: {}", why))
+    };
+
+    let filesize = file_metadata.len();
+
+    let file_blocks = ((filesize as u64 + BLOCK_SIZE as u64 - 1u64) / BLOCK_SIZE as u64) as u32;
+    
+    let mut block_ptrs = [0u32; 8];
+
+    let allocated = find_free_blocks(img_file, file_blocks)?;
+    
+    set_blocks_used(img_file, allocated, file_blocks as u64)?;
+
+    let starting_block = ((allocated - superblock.blocks_ptr) / BLOCK_SIZE as u64) as u32;
+
+    for i in 0..std::cmp::min(file_blocks, 8) {
+        block_ptrs[i as usize] = starting_block + i as u32;
+    }
+
+    let mut first_layer_indirect_ptrs = FileFirstIndirectBlock {
+        more_indirect_blocks: [0u32; 0x400]
+    };
+    
+    let extra_block_count = if filesize < 0x8000 {
+        0
+    }
+    else {
+        (filesize - BLOCK_SIZE as u64 * 7 - 1) / 0x1000
+    };
+
+    let mut blocks_left = extra_block_count;
+
+    let second_layer_blocks = (extra_block_count + 0x3FF) / 0x400;
+
+    let indirect_first_ptr = if extra_block_count > 0 {
+        let first_layer_ptr = find_free_blocks(img_file, 1)?;
+        set_blocks_used(img_file, first_layer_ptr, 1)?;
+
+        for i in 0..second_layer_blocks {
+            let second_layer_indirect_ptr = find_free_blocks(img_file, 1)?;
+            
+            let mut second_layer_indirect_block = FileSecondIndirectBlock {
+                blocks: [0u32; 0x400]
+            };
+
+            for j in 0..(std::cmp::min(blocks_left, 0x400)) {
+                second_layer_indirect_block.blocks[j as usize] = (starting_block as u64 + 8 + i * 0x400 + j) as u32;
+                blocks_left -= 1;
+            }
+
+            first_layer_indirect_ptrs.more_indirect_blocks[i as usize] = ((second_layer_indirect_ptr - superblock.blocks_ptr) / BLOCK_SIZE as u64) as u32;
+
+            match img_file.write_all_at(match &(bincode::serialize(&second_layer_indirect_block)) {
+                    Ok(v) => v,
+                    Err(why) => return Err(format!("Failed to serialize ptr block: {}", why))
+                }, second_layer_indirect_ptr) {
+                Ok(_) => set_blocks_used(img_file, second_layer_indirect_ptr, 1)?,
+                Err(why) => return Err(format!("Failed to write ptr block: {}", why))
+            }
+        }
+
+        match img_file.write_all_at(match &(bincode::serialize(&first_layer_indirect_ptrs)) {
+                Ok(v) => v,
+                Err(why) => return Err(format!("Failed to serialize ptr block: {}", why))
+            }, first_layer_ptr) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed to write ptr block: {}", why))
+        }
+
+        first_layer_ptr
+    }
+    else {
+        0
+    };
+
+    let indirect_inode_block = if indirect_first_ptr > 0 {
+        ((indirect_first_ptr - superblock.blocks_ptr) / BLOCK_SIZE as u64) as u32
+    }
+    else {
+        0
+    };
+
+    
+    let file_inode = INode {
+        created_time: helpers::get_current_timestamp(),
+        last_accessed: helpers::get_current_timestamp(),
+        link_count: 1,
+        subtype_info: INodeSubtype::File {
+            size: filesize as u32,
+            direct_block_ptrs: block_ptrs,
+            indirect_ptr: indirect_inode_block
+        },
+    };
+
+    let mut block_to_write = 0;
+
+    let mut bytes_left = filesize;
+
+    while bytes_left > 0 {
+        let mut buf = vec![0u8; std::cmp::min(bytes_left as usize, 0x1000)];
+
+        match file.read_exact(&mut buf) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed to read file: {}", why)),
+        }
+
+        let dest_address = allocated + block_to_write * BLOCK_SIZE as u64;
+
+        block_to_write += 1;
+
+        match img_file.write_all_at(&mut buf, dest_address) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed to copy file: {}", why))
+        }
+
+        bytes_left -= std::cmp::min(bytes_left, 0x1000);
+    }
+
+    match img_file.write_all_at(match &(bincode::serialize(&file_inode)) {
+                Ok(v) => v,
+                Err(why) => return Err(format!("Failed to serialize inode: {}", why))
+            }, inode_ptr) {
+        Ok(_) => set_inode_used(img_file, inode_ptr)?,
+        Err(why) => return Err(format!("Failed to write inode: {}", why))
+    }
+
+    update_superblock(img_file)?;
+
+    Ok(())
+}
+
+pub fn get_file(img_file: &mut File, file_to_write: &PathBuf, dir: &String) -> Result<(), String> {
+    let superblock = get_superblock(img_file)?;
+   
+    let dir = String::from(dir.trim_matches('/'));
+    let dir_split = dir.split('/').collect::<Vec<&str>>();
+
+    let filename = match dir_split.last() {
+        Some(v) => v.to_owned(),
+        None => return Err(format!("Cannot find file with empty name \"{}\".", dir))
+    };
+
+    let parent_path = dir_split[0..(dir_split.len()-1)].join("/");
+
+    let parent_inode_address = if parent_path == "" {
+        superblock.inode_blocks_ptr
+    }
+    else {
+        match find_folder_inode(img_file, &parent_path)? {
+            Some(v) => v,
+            None => return Err(format!("Directory {} does not exist.", parent_path))
+        }
+    };
+
+    let mut dir_inode = get_inode(img_file, parent_inode_address)?;
+    
+    dir_inode.last_accessed = helpers::get_current_timestamp();
+    
+    let mut file_inode_address = 0u64;
+
+    match dir_inode.subtype_info {
+        INodeSubtype::File { .. } => return Err(format!("{} is a file, not a directory.", &parent_path)),
+        INodeSubtype::Directory { item_count, inode_table_block } => {
+            let file_entry_address = superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64;
+
+            let parent_file_entries = get_file_struct::<DirectoryBlock, 0x1000>(img_file, file_entry_address)?;
+            
+            for i in 0..item_count {
+                let entry = parent_file_entries.file_entries[i as usize];
+
+                if helpers::get_string_from_array(&entry.filename) == filename {
+                    file_inode_address = entry.file_inode_ptr;
+
+                    break;
+                }
+            }
+
+            if file_inode_address == 0 {
+                return Err(format!("File {} not found in {}.", filename, dir));
+            }
+        },
+    }
+
+    let file_inode = get_inode(img_file, file_inode_address)?;
+
+    let (filesize, file_direct_ptrs, file_indirect_ptr) = match file_inode.subtype_info {
+        INodeSubtype::File { size, direct_block_ptrs, indirect_ptr } => (size, direct_block_ptrs, indirect_ptr),
+        INodeSubtype::Directory { .. } => return Err(format!("{} is a directory, not a file!", filename)),
+    };
+
+    let file_blocks = file_inode.get_blocks_used();
+
+    let path = file_to_write.as_path();
+
+    let mut file = match File::create(path) {
+        Ok(v) => v,
+        Err(why) => return Err(format!("Couldn't create file {}: {}", path.to_str().unwrap(), why))
+    };
+
+    match file.set_len(filesize as u64) {
+        Ok(_) => (),
+        Err(why) => return Err(format!("Failed to create file {} with size {}: {}", path.to_str().unwrap(), filesize, why)),
+    };
+   
+    let mut bytes_left = filesize;
+
+    for i in 0..(std::cmp::min(file_blocks, 8)) {
+        let mut buf = vec![0u8; std::cmp::min(bytes_left as usize, 0x1000)];
+
+        match img_file.read_exact_at(&mut buf, superblock.blocks_ptr + file_direct_ptrs[i as usize] as u64 * BLOCK_SIZE as u64) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed reading file blocks: {}", why)),
+        }
+        
+        match file.write_all(&buf) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed writing to file: {}", why)),
+        }
+
+        bytes_left -= std::cmp::min(0x1000, bytes_left);
+    }
+
+    if file_indirect_ptr > 0 {
+        let file_indirect_ptr = superblock.blocks_ptr + file_indirect_ptr as u64 * BLOCK_SIZE as u64;
+        
+        let mut blocks_left_to_read = (bytes_left + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        let block_blocks_left_to_read = blocks_left_to_read + 0x3FF / 0x400;
+        
+        let first_layer = get_file_struct::<FileFirstIndirectBlock, 0x1000>(img_file, file_indirect_ptr)?;
+
+        for i in 0..block_blocks_left_to_read {
+            let second_layer_indirect_ptr = first_layer.more_indirect_blocks[i as usize];
+            let second_layer_indirect_ptr = superblock.blocks_ptr + second_layer_indirect_ptr as u64 * BLOCK_SIZE as u64;
+            let second_layer = get_file_struct::<FileSecondIndirectBlock, 0x1000>(img_file, second_layer_indirect_ptr)?;
+
+            for j in 0..(std::cmp::min(blocks_left_to_read, 0x400)) {
+                let block_ptr = second_layer.blocks[j as usize];
+                let block_ptr = superblock.blocks_ptr + block_ptr as u64 * BLOCK_SIZE as u64;
+
+                let mut buf = vec![0u8; std::cmp::min(bytes_left as usize, 0x1000)];
+                
+                match img_file.read_exact_at(&mut buf, block_ptr) {
+                    Ok(()) => (),
+                    Err(why) => return Err(format!("Failed to read file block at {}: {}", block_ptr, why)),
+                }
+
+                match file.write_all(&mut buf) {
+                    Ok(()) => (),
+                    Err(why) => return Err(format!("Failed to write file block: {}", why))
+                }
+
+                blocks_left_to_read -= 1;
+            }
+        }
+    }
+    
+    update_superblock(img_file)?;
+
+    Ok(())
 }
 
 pub fn list(file: &mut File, dir: &String) -> Result<(), String> {
@@ -653,9 +984,8 @@ fn update_superblock(file: &mut File) -> Result<(), String> {
             let mut mask = 0x80u8;
 
             while mask != 0 {
-                if byte & mask == 1 {
-                    count += 1;
-                
+                if byte & mask != 0 {
+                    count += 1; 
                 }
                 mask /= 2;
             }

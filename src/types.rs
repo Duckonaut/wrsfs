@@ -51,6 +51,18 @@ pub struct DirectoryBlock {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct FileFirstIndirectBlock {
+    #[serde(with = "BigArray")]
+    pub more_indirect_blocks: [u32; 0x400]
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct FileSecondIndirectBlock {
+    #[serde(with = "BigArray")]
+    pub blocks: [u32; 0x400]
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 pub struct Superblock {
     pub magic: u32, // hardcoded
     pub block_size: u32, // hardcoded
