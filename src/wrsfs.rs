@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use crate::{types::{self, Superblock, SMALLEST_IMAGE_SIZE, BLOCK_SIZE, DirectoryBlock, DirectoryFileEntry, INode, INodeSubtype, INODE_SIZE, FsBitmapBlock, BLOCK_BITMAP_SIZE_DESCRIBED, FileFirstIndirectBlock, FileSecondIndirectBlock}, helpers};
 use crate::helpers::get_current_timestamp;
 
-
+/// Creates a WRSFS virtual disk as a file at <imgname> with size <size> in bytes
 pub fn createfs(imgname: PathBuf, size: u64) -> Result<(), String> {
     if size < SMALLEST_IMAGE_SIZE { // 16 MB minimum disk, just to be sure
         return Err(format!("Image size {size} too small! Smallest size possible: {SMALLEST_IMAGE_SIZE}"));
@@ -39,6 +39,7 @@ pub fn createfs(imgname: PathBuf, size: u64) -> Result<(), String> {
     }
 }
 
+/// Shows info about a virtual disk at <imgname> with extra info flags <usage> and <ptrs>
 pub fn info(imgname: PathBuf, usage: bool, ptrs: bool) -> Result<(), String> {
     let mut file = match OpenOptions::new().read(true).write(true).open(&imgname) {
         Ok(file) => file,
@@ -117,193 +118,15 @@ pub fn info(imgname: PathBuf, usage: bool, ptrs: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns a pointer to the first section of `block_count` blocks
-pub fn find_free_blocks(file: &mut File, block_count: u32) -> Result<u64, String> {
-    let superblock = get_superblock(file)?;
-
-    let mut block_bitmap_bytes = [0u8; BLOCK_SIZE as usize];
-
-    let bitmap_block_count = (superblock.inode_bitmap_ptr - superblock.block_bitmap_ptr) / BLOCK_SIZE as u64;
-
-    let mut free_blocks_ptr: u64 = 0;
-
-    'block_loop: for i in 0..bitmap_block_count {
-        match file.read_exact_at(&mut block_bitmap_bytes, superblock.block_bitmap_ptr + i * BLOCK_SIZE as u64) {
-            Ok(_) => (),
-            Err(why) => return Err(format!("Failed to read block bitmap: {}", why))
-        }
-
-        let mut count = 0u32;
-        
-        for (byte_index, byte) in block_bitmap_bytes.iter().enumerate() {
-            let mut mask = 0x80u8;
-            let mut index = 0u64;
-
-            while mask != 0 {
-                if byte & mask == 0 {
-                    count += 1;
-
-                    if count == block_count {
-                        free_blocks_ptr = superblock.blocks_ptr + (i * BLOCK_BITMAP_SIZE_DESCRIBED as u64) + ((byte_index as u64) * 8 + index + 1 - count as u64) * BLOCK_SIZE as u64;
-                        break 'block_loop; 
-                    }
-                }
-                else {
-                    count = 0;
-                }
-                mask /= 2;
-                index += 1;
-            }
-        }
-    }
-    
-    if free_blocks_ptr == 0 {
-        Err(format!("Couldn't find {} free blocks", block_count))
-    }
-    else {
-        Ok(free_blocks_ptr)
-    }
-}
-
-/// Returns a pointer to the free INode section
-pub fn find_free_inode(file: &mut File) -> Result<u64, String> {
-    let superblock = get_superblock(file)?;
-
-    let mut block_bitmap_bytes = [0u8; BLOCK_SIZE as usize];
-
-    let bitmap_block_count = (superblock.inode_blocks_ptr - superblock.inode_bitmap_ptr) / BLOCK_SIZE as u64;
-
-    let mut free_inode_ptr: u64 = 0;
-
-    'block_loop: for i in 0..bitmap_block_count {
-        match file.read_exact_at(&mut block_bitmap_bytes, superblock.inode_bitmap_ptr + i * BLOCK_SIZE as u64) {
-            Ok(()) => (),
-            Err(why) => return Err(format!("Couldn't read inode bitmap: {}", why))
-        }
-
-        let mut ptr = 0usize;
-        for byte in block_bitmap_bytes {
-            let mut mask = 0x80u8;
-
-            while mask != 0 {
-                if byte & mask == 0 {
-                    free_inode_ptr = superblock.inode_blocks_ptr + ((i * BLOCK_SIZE as u64) * 8 + ptr as u64) * INODE_SIZE as u64;
-                    break 'block_loop; 
-                }
-
-                mask /= 2;
-                ptr += 1;
-            }
-        }
-    }
-
-    if free_inode_ptr == 0 {
-        Err(String::from("Couldn't find free inode"))
-    }
-    else {
-        Ok(free_inode_ptr)
-    }
-}
-
-fn set_blocks_used(file: &mut File, block_ptr: u64, block_count: u64) -> Result<(), String> {
-    let superblock = get_superblock(file)?;
-
-    let block_index = (block_ptr - superblock.blocks_ptr) / BLOCK_SIZE as u64;
-
-
-    let bitmap_start_byte = superblock.block_bitmap_ptr + block_index / 8;
-
-    let start_offset_in_byte = block_index % 8;
-
-    let mut mask = 0x80 >> start_offset_in_byte;
-
-    let mut bitmap_buffer = [0u8; BLOCK_SIZE as usize];
-
-    let current_block = bitmap_start_byte / BLOCK_SIZE as u64;
-
-    match file.read_exact_at(&mut bitmap_buffer, current_block * BLOCK_SIZE as u64) {
-        Ok(()) => (),
-        Err(why) => return Err(format!("Couldn't read bitmap: {}", why)),
-    };
-
-    let mut blocks_set = 0;
-    let mut bitmap_block = current_block;
-    let mut bitmap_ptr = bitmap_start_byte % BLOCK_SIZE as u64;
-    
-    while blocks_set != block_count {
-        let mut byte: u8 = match bitmap_buffer[bitmap_ptr as usize].try_into() {
-            Ok(v) => v,
-            Err(why) => return Err(format!("Failed to get byte to set: {}", why)),
-        };
-
-        while mask != 0 {
-            byte |= mask;
-            blocks_set += 1;
-
-            if blocks_set == block_count {
-                break;
-            }
-
-            mask /= 2;
-        }
-
-        bitmap_buffer[bitmap_ptr as usize] = byte;
-
-        bitmap_ptr += 1;
-        mask = 0x80;
-
-        if bitmap_ptr >= BLOCK_SIZE as u64 {
-            file.write_all_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't write bitmap");
-
-            bitmap_block += 1;
-
-            file.read_exact_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't read bitmap");
-
-            bitmap_ptr = 0;
-        }
-            
-    }
-    
-    file.write_all_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't write bitmap");
-
-    Ok(())
-}
-
-fn set_inode_used(file: &mut File, inode_ptr: u64) -> Result<(), String> {
-    let superblock = get_superblock(file)?;
-
-    let block_index = (inode_ptr - superblock.inode_blocks_ptr) / BLOCK_SIZE as u64;
-    let inode_index_in_block = (inode_ptr % BLOCK_SIZE as u64) / (BLOCK_SIZE / INODE_SIZE) as u64;
-    let inode_bitmap_byte_address = superblock.inode_bitmap_ptr + block_index * BLOCK_SIZE as u64 + inode_index_in_block / 8;
-    let mask = 0x80u8 >> (inode_index_in_block % 8);
-
-    let mut inode_bitmap_byte: [u8; 1] = [0];
-
-    match file.read_exact_at(&mut inode_bitmap_byte, inode_bitmap_byte_address) {
-        Ok(()) => (),
-        Err(why) => return Err(format!("Couldn't read bitmap: {}", why)),
-    };
-
-    inode_bitmap_byte[0] |= mask;
-
-
-    match file.write_at(&inode_bitmap_byte, inode_bitmap_byte_address) {
-        Ok(_) => (),
-        Err(why) => return Err(format!("Couldn't write bitmap: {}", why)),
-    };
-    
-
-    Ok(())
-}
-
-
 /// Returns a pointer to a directory block
 pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     let free_blocks_for_dir = find_free_blocks(file, 1)?;
+
+    set_blocks_used(file, free_blocks_for_dir, 1, true)?;
     
     let inode_ptr = find_free_inode(file)?;
 
-    set_inode_used(file, inode_ptr)?;
+    set_inode_used(file, inode_ptr, true)?;
     
     let superblock = get_superblock(file)?;
     
@@ -349,8 +172,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write directory block: {}", why)),
         }
 
-        set_blocks_used(file, free_blocks_for_dir, 1)?;
-
         update_superblock(file)?;
     }
     else {
@@ -384,8 +205,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             }
         };
         
-        dbg!(&parent_path);
-        dbg!(&parent_folder);
 
         let dir_name = match path_parts.last() {
             Some(v) => v.to_owned(),
@@ -419,7 +238,6 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
 
         let mut parent_folder_inode = get_inode(file, parent_folder)?;
         
-        parent_folder_inode.link_count += 1;
         parent_folder_inode.last_accessed = helpers::get_current_timestamp();
 
         match parent_folder_inode.subtype_info {
@@ -476,14 +294,13 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             Err(why) => return Err(format!("Couldn't write directory block: {}", why)),
         }
 
-        set_blocks_used(file, free_blocks_for_dir, 1)?;
-
         update_superblock(file)?;
 
     }
     Ok(inode_ptr)
 }
 
+/// Copies file <file> to file at path <dir> in <img_file>
 pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(), String> {
     let superblock = get_superblock(img_file)?;
 
@@ -574,7 +391,7 @@ pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(
 
     let allocated = find_free_blocks(img_file, file_blocks)?;
     
-    set_blocks_used(img_file, allocated, file_blocks as u64)?;
+    set_blocks_used(img_file, allocated, file_blocks as u64, true)?;
 
     let starting_block = ((allocated - superblock.blocks_ptr) / BLOCK_SIZE as u64) as u32;
 
@@ -599,7 +416,7 @@ pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(
 
     let indirect_first_ptr = if extra_block_count > 0 {
         let first_layer_ptr = find_free_blocks(img_file, 1)?;
-        set_blocks_used(img_file, first_layer_ptr, 1)?;
+        set_blocks_used(img_file, first_layer_ptr, 1, true)?;
 
         for i in 0..second_layer_blocks {
             let second_layer_indirect_ptr = find_free_blocks(img_file, 1)?;
@@ -619,7 +436,7 @@ pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(
                     Ok(v) => v,
                     Err(why) => return Err(format!("Failed to serialize ptr block: {}", why))
                 }, second_layer_indirect_ptr) {
-                Ok(_) => set_blocks_used(img_file, second_layer_indirect_ptr, 1)?,
+                Ok(_) => set_blocks_used(img_file, second_layer_indirect_ptr, 1, true)?,
                 Err(why) => return Err(format!("Failed to write ptr block: {}", why))
             }
         }
@@ -685,7 +502,7 @@ pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(
                 Ok(v) => v,
                 Err(why) => return Err(format!("Failed to serialize inode: {}", why))
             }, inode_ptr) {
-        Ok(_) => set_inode_used(img_file, inode_ptr)?,
+        Ok(_) => set_inode_used(img_file, inode_ptr, true)?,
         Err(why) => return Err(format!("Failed to write inode: {}", why))
     }
 
@@ -694,6 +511,7 @@ pub fn copy_file(img_file: &mut File, file: &mut File, dir: &String) -> Result<(
     Ok(())
 }
 
+/// Copies file <dir> from virtual disk <img_file> to file on disk at <file_to_write>
 pub fn get_file(img_file: &mut File, file_to_write: &PathBuf, dir: &String) -> Result<(), String> {
     let superblock = get_superblock(img_file)?;
    
@@ -825,6 +643,201 @@ pub fn get_file(img_file: &mut File, file_to_write: &PathBuf, dir: &String) -> R
     Ok(())
 }
 
+pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
+    let superblock = get_superblock(file)?;
+   
+    let dir = String::from(dir.trim().trim_matches('/'));
+
+    if dir == "" || dir == "/" {
+        return Err(format!("Cannot delete root!"))
+    }
+
+    let dir_split = dir.split('/').collect::<Vec<&str>>();
+
+    let filename = match dir_split.last() {
+        Some(v) => v.to_owned(),
+        None => return Err(format!("Cannot delete at empty path \"{}\".", dir))
+    };
+
+    if filename == "." || filename == ".." {
+        return Err(format!("Cannot remove directory links like {}", filename));
+    }
+
+    let parent_path = dir_split[0..(dir_split.len()-1)].join("/");
+
+    let parent_inode_address = if parent_path == "" {
+        superblock.inode_blocks_ptr
+    }
+    else {
+        match find_folder_inode(file, &parent_path)? {
+            Some(v) => v,
+            None => return Err(format!("Directory {} does not exist.", parent_path))
+        }
+    };
+
+    let mut dir_inode = get_inode(file, parent_inode_address)?;
+    
+    dir_inode.last_accessed = helpers::get_current_timestamp();
+    
+    let mut item_inode_address = 0u64;
+
+    match dir_inode.subtype_info {
+        INodeSubtype::File { .. } => return Err(format!("{} is a file, not a directory.", &parent_path)),
+        INodeSubtype::Directory { ref mut item_count, inode_table_block } => {
+            let file_entry_address = superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64;
+
+            let parent_file_entries = get_file_struct::<DirectoryBlock, 0x1000>(file, file_entry_address)?;
+            
+            for i in 0..*item_count {
+                let entry = parent_file_entries.file_entries[i as usize];
+
+                if helpers::get_string_from_array(&entry.filename) == filename {
+                    item_inode_address = entry.file_inode_ptr;
+                    
+                    // check what to delete first, before removing any access to it in case of error
+                    let mut item_inode = get_inode(file, item_inode_address)?;
+
+                    match item_inode.subtype_info {
+                        INodeSubtype::Directory { item_count, inode_table_block } => {
+                            if item_inode.link_count > 2 {
+                                item_inode.link_count -= 1;
+
+                                match file.write_all_at(&(match bincode::serialize(&item_inode) {
+                                        Ok(b) => b,
+                                        Err(why) => return Err(format!("Couldn't serialize inode: {}", why))
+                                    }), item_inode_address) {
+                                    Ok(()) => (),
+                                    Err(why) => return Err(format!("Couldn't write inode: {}", why)),
+                                }
+
+                                return Ok(())
+                            }
+
+                            if item_count > 2 {
+                                return Err(format!("Directory {} not empty!", filename));
+                            }
+
+                            set_blocks_used(file, superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64, 1, false)?; 
+
+                            set_inode_used(file, item_inode_address, false)?;
+                        },
+                        INodeSubtype::File { size: _, direct_block_ptrs, indirect_ptr } => {
+                            if item_inode.link_count > 1 {
+                                item_inode.link_count -= 1;
+
+                                match file.write_all_at(&(match bincode::serialize(&item_inode) {
+                                        Ok(b) => b,
+                                        Err(why) => return Err(format!("Couldn't serialize inode: {}", why))
+                                    }), item_inode_address) {
+                                    Ok(()) => (),
+                                    Err(why) => return Err(format!("Couldn't write inode: {}", why)),
+                                }
+
+                                return Ok(())
+                            }
+
+                            let file_blocks = item_inode.get_blocks_used();
+
+                            // I could just clean it in a single block as it is, but cleaning it block by block
+                            // allows for more flexible allocation patterns in the future
+
+                            let mut blocks_left_to_free = file_blocks;
+
+                            for i in 0..(std::cmp::min(blocks_left_to_free, 8)) {
+                                set_blocks_used(file, superblock.blocks_ptr + direct_block_ptrs[i as usize] as u64 * BLOCK_SIZE as u64, 1, false)?;
+
+                                blocks_left_to_free -= 1;
+                            }
+
+                            if indirect_ptr > 0 {
+                                let file_indirect_ptr = superblock.blocks_ptr + indirect_ptr as u64 * BLOCK_SIZE as u64;
+
+                                let block_blocks_left_to_free = blocks_left_to_free + 0x3FF / 0x400;
+                        
+                                let first_layer = get_file_struct::<FileFirstIndirectBlock, 0x1000>(file, file_indirect_ptr)?;
+
+                                for i in 0..block_blocks_left_to_free {
+                                    let second_layer_indirect_ptr = first_layer.more_indirect_blocks[i as usize];
+                                    let second_layer_indirect_ptr = superblock.blocks_ptr + second_layer_indirect_ptr as u64 * BLOCK_SIZE as u64;
+                                    let second_layer = get_file_struct::<FileSecondIndirectBlock, 0x1000>(file, second_layer_indirect_ptr)?;
+
+                                    for j in 0..(std::cmp::min(blocks_left_to_free, 0x400)) {
+                                        let block_ptr = second_layer.blocks[j as usize];
+                                        let block_ptr = superblock.blocks_ptr + block_ptr as u64 * BLOCK_SIZE as u64;
+
+                                        set_blocks_used(file, block_ptr, 1, false)?;
+                                    
+                                        blocks_left_to_free -= 1;
+                                    }
+
+                                    set_blocks_used(file, second_layer_indirect_ptr, 1, false)?;
+                                }
+
+                                set_blocks_used(file, file_indirect_ptr, 1, false)?;
+                            }
+
+                            set_inode_used(file, item_inode_address, false)?;
+                        },
+                    };
+
+                    // have to reorder file entries
+                    
+                    if item_inode_address == superblock.inode_blocks_ptr {
+                        return Err(format!("Cannot delete root"))
+                    }
+                    
+                    let mut new_file_entries = DirectoryBlock {
+                        file_entries: [DirectoryFileEntry {
+                            file_inode_ptr: 0,
+                            filename: [0u8; 56]
+                        }; 0x40]
+                    };
+
+                    let mut index = 0usize;
+
+                    for j in 0..*item_count {
+                        if j != i {
+                            new_file_entries.file_entries[j as usize] = parent_file_entries.file_entries[index];
+
+                            index += 1;
+                        }
+                    }
+
+                    *item_count -= 1;
+
+                    match file.write_all_at(&(match bincode::serialize(&new_file_entries) {
+                            Ok(b) => b,
+                            Err(why) => return Err(format!("Couldn't serialize dir block: {}", why))
+                        }), file_entry_address) {
+                        Ok(()) => (),
+                        Err(why) => return Err(format!("Couldn't write dir block: {}", why)),
+                    }
+
+                    break;
+                }
+            }
+
+            if item_inode_address == 0 {
+                return Err(format!("Item {} not found in {}.", filename, dir));
+            }
+        },
+    }
+
+    match file.write_all_at(&(match bincode::serialize(&dir_inode) {
+            Ok(b) => b,
+            Err(why) => return Err(format!("Couldn't serialize directory inode: {}", why))
+        }), parent_inode_address) {
+        Ok(()) => (),
+        Err(why) => return Err(format!("Couldn't write directory inode: {}", why)),
+    }
+
+    update_superblock(file)?;
+
+    Ok(())
+
+}
+
+/// Lists directory <dir> in virtual disk <file> content along with basic info about members
 pub fn list(file: &mut File, dir: &String) -> Result<(), String> {
     let superblock = get_superblock(file)?;
     
@@ -852,6 +865,7 @@ pub fn list(file: &mut File, dir: &String) -> Result<(), String> {
 
     for i in 0..item_count {
         let item = dir_block.file_entries[i as usize];
+
         let name = helpers::get_string_from_array(&item.filename);
         let item_inode = get_inode(file, item.file_inode_ptr)?;
 
@@ -889,6 +903,194 @@ fn set_superblock(file: &mut File, superblock: Superblock) -> Result<(), String>
         Ok(()) => Ok(()),
         Err(why) => Err(why.to_string()),
     }
+}
+
+/// Returns a pointer to the first section of `block_count` blocks
+pub fn find_free_blocks(file: &mut File, block_count: u32) -> Result<u64, String> {
+    let superblock = get_superblock(file)?;
+
+    let mut block_bitmap_bytes = [0u8; BLOCK_SIZE as usize];
+
+    let bitmap_block_count = (superblock.inode_bitmap_ptr - superblock.block_bitmap_ptr) / BLOCK_SIZE as u64;
+
+    let mut free_blocks_ptr: u64 = 0;
+
+    'block_loop: for i in 0..bitmap_block_count {
+        match file.read_exact_at(&mut block_bitmap_bytes, superblock.block_bitmap_ptr + i * BLOCK_SIZE as u64) {
+            Ok(_) => (),
+            Err(why) => return Err(format!("Failed to read block bitmap: {}", why))
+        }
+
+        let mut count = 0u32;
+        
+        for (byte_index, byte) in block_bitmap_bytes.iter().enumerate() {
+            let mut mask = 0x80u8;
+            let mut index = 0u64;
+
+            while mask != 0 {
+                if byte & mask == 0 {
+                    count += 1;
+
+                    if count == block_count {
+                        free_blocks_ptr = superblock.blocks_ptr + (i * BLOCK_BITMAP_SIZE_DESCRIBED as u64) + ((byte_index as u64) * 8 + index + 1 - count as u64) * BLOCK_SIZE as u64;
+                        break 'block_loop; 
+                    }
+                }
+                else {
+                    count = 0;
+                }
+                mask /= 2;
+                index += 1;
+            }
+        }
+    }
+    
+    if free_blocks_ptr == 0 {
+        Err(format!("Couldn't find {} free blocks", block_count))
+    }
+    else {
+        Ok(free_blocks_ptr)
+    }
+}
+
+fn set_blocks_used(file: &mut File, block_ptr: u64, block_count: u64, used: bool) -> Result<(), String> {
+    let superblock = get_superblock(file)?;
+
+    let block_index = (block_ptr - superblock.blocks_ptr) / BLOCK_SIZE as u64;
+
+
+    let bitmap_start_byte = superblock.block_bitmap_ptr + block_index / 8;
+
+    let start_offset_in_byte = block_index % 8;
+
+    let mut mask = 0x80 >> start_offset_in_byte;
+
+    let mut bitmap_buffer = [0u8; BLOCK_SIZE as usize];
+
+    let current_block = bitmap_start_byte / BLOCK_SIZE as u64;
+
+    match file.read_exact_at(&mut bitmap_buffer, current_block * BLOCK_SIZE as u64) {
+        Ok(()) => (),
+        Err(why) => return Err(format!("Couldn't read bitmap: {}", why)),
+    };
+
+    let mut blocks_set = 0;
+    let mut bitmap_block = current_block;
+    let mut bitmap_ptr = bitmap_start_byte % BLOCK_SIZE as u64;
+    
+    while blocks_set != block_count {
+        let mut byte: u8 = match bitmap_buffer[bitmap_ptr as usize].try_into() {
+            Ok(v) => v,
+            Err(why) => return Err(format!("Failed to get byte to set: {}", why)),
+        };
+
+        while mask != 0 {
+            if used {
+                byte |= mask;
+            }
+            else {
+                byte &= !mask;
+            }
+            blocks_set += 1;
+
+            if blocks_set == block_count {
+                break;
+            }
+
+            mask /= 2;
+        }
+
+        bitmap_buffer[bitmap_ptr as usize] = byte;
+
+        bitmap_ptr += 1;
+        mask = 0x80;
+
+        if bitmap_ptr >= BLOCK_SIZE as u64 {
+            file.write_all_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't write bitmap");
+
+            bitmap_block += 1;
+
+            file.read_exact_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't read bitmap");
+
+            bitmap_ptr = 0;
+        }
+            
+    }
+    
+    file.write_all_at(&mut bitmap_buffer, bitmap_block * BLOCK_SIZE as u64).expect("Couldn't write bitmap");
+
+    Ok(())
+}
+
+/// Returns a pointer to the free INode section
+pub fn find_free_inode(file: &mut File) -> Result<u64, String> {
+    let superblock = get_superblock(file)?;
+
+    let mut block_bitmap_bytes = [0u8; BLOCK_SIZE as usize];
+
+    let bitmap_block_count = (superblock.inode_blocks_ptr - superblock.inode_bitmap_ptr) / BLOCK_SIZE as u64;
+
+    let mut free_inode_ptr: u64 = 0;
+
+    'block_loop: for i in 0..bitmap_block_count {
+        match file.read_exact_at(&mut block_bitmap_bytes, superblock.inode_bitmap_ptr + i * BLOCK_SIZE as u64) {
+            Ok(()) => (),
+            Err(why) => return Err(format!("Couldn't read inode bitmap: {}", why))
+        }
+
+        let mut ptr = 0usize;
+        for byte in block_bitmap_bytes {
+            let mut mask = 0x80u8;
+
+            while mask != 0 {
+                if byte & mask == 0 {
+                    free_inode_ptr = superblock.inode_blocks_ptr + ((i * BLOCK_SIZE as u64) * 8 + ptr as u64) * INODE_SIZE as u64;
+                    break 'block_loop; 
+                }
+
+                mask /= 2;
+                ptr += 1;
+            }
+        }
+    }
+
+    if free_inode_ptr == 0 {
+        Err(String::from("Couldn't find free inode"))
+    }
+    else {
+        Ok(free_inode_ptr)
+    }
+}
+
+fn set_inode_used(file: &mut File, inode_ptr: u64, used: bool) -> Result<(), String> {
+    let superblock = get_superblock(file)?;
+
+    let block_index = (inode_ptr - superblock.inode_blocks_ptr) / BLOCK_SIZE as u64;
+    let inode_index_in_block = (inode_ptr % BLOCK_SIZE as u64) / (BLOCK_SIZE / INODE_SIZE) as u64;
+    let inode_bitmap_byte_address = superblock.inode_bitmap_ptr + block_index * BLOCK_SIZE as u64 + inode_index_in_block / 8;
+    let mask = 0x80u8 >> (inode_index_in_block % 8);
+
+    let mut inode_bitmap_byte: [u8; 1] = [0];
+
+    match file.read_exact_at(&mut inode_bitmap_byte, inode_bitmap_byte_address) {
+        Ok(()) => (),
+        Err(why) => return Err(format!("Couldn't read bitmap: {}", why)),
+    };
+
+    if used {
+        inode_bitmap_byte[0] |= mask;
+    }
+    else {
+        inode_bitmap_byte[0] &= !mask;
+    }
+
+    match file.write_at(&inode_bitmap_byte, inode_bitmap_byte_address) {
+        Ok(_) => (),
+        Err(why) => return Err(format!("Couldn't write bitmap: {}", why)),
+    };
+    
+
+    Ok(())
 }
 
 fn find_folder_inode(file: &mut File, path: &String) -> Result<Option<u64>, String> {
@@ -936,7 +1138,7 @@ fn get_inode(file: &mut File, inode_ptr: u64) -> Result<INode, String> {
    get_file_struct::<INode, 0x40>(file, inode_ptr) 
 }
 
-/// Util function. Garbage in, garbage out, so yeah.
+/// Util function. Garbage in, garbage out, use at your own caution.
 fn get_file_struct<'de, T: Sized + DeserializeOwned, const BYTE_COUNT: usize>(file: &mut File, struct_ptr: u64) -> Result<T, String> {
     let mut struct_buf = [0u8; BYTE_COUNT];
 

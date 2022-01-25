@@ -1,7 +1,7 @@
 use std::{path::PathBuf, fs::OpenOptions};
 
 use structopt::StructOpt;
-use wrsfs::{create_dir, list, copy_file, get_file};
+use wrsfs::{create_dir, list, copy_file, get_file, remove};
 
 mod wrsfs;
 mod types;
@@ -28,6 +28,10 @@ enum Args {
         filename: String,
         target_filename: PathBuf
     },
+    Rm {
+        imgname: PathBuf,
+        itemname: String
+    },
     Ls {
         imgname: PathBuf,
         #[structopt(default_value = "/")]
@@ -51,6 +55,7 @@ fn main() {
         Args::Mkdir { imgname, dir } => mkdir(imgname, dir),
         Args::Cp { imgname, filename, target_filename } => cp(imgname, filename, target_filename),
         Args::Get { imgname, filename, target_filename } => get(imgname, filename, target_filename),
+        Args::Rm { imgname, itemname } => rm(imgname, itemname),
         Args::Ls { imgname, dir } => ls(imgname, dir),
         Args::Info { imgname, usage, pointers } => info(imgname, usage, pointers),
         Args::Debug => debug(),
@@ -139,6 +144,23 @@ fn get(imgname: PathBuf, filename: String, target_filename: PathBuf) {
     }
 }
 
+fn rm(imgname: PathBuf, itemname: String) {
+    let img_path = imgname.as_path();
+
+    let mut img_file = match OpenOptions::new().read(true).write(true).open(img_path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", img_path.to_str().unwrap(), why);
+            return;
+        }
+    };
+    
+    match remove(&mut img_file, &itemname) {
+        Ok(()) => println!("Removed item {}", &itemname),
+        Err(why) => println!("Failed to remove item: {}", why)
+    }
+
+}
 
 fn ls(imgname: PathBuf, dir: String) {
     let path = imgname.as_path();
