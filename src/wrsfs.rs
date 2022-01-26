@@ -121,6 +121,8 @@ pub fn info(imgname: PathBuf, usage: bool, ptrs: bool) -> Result<(), String> {
 /// Returns a pointer to a directory block
 pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
     let free_blocks_for_dir = find_free_blocks(file, 1)?;
+    
+    dbg!(&free_blocks_for_dir);
 
     set_blocks_used(file, free_blocks_for_dir, 1, true)?;
     
@@ -185,6 +187,8 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             },
         };
 
+        dbg!(&inode);
+
         let mut dir_block = DirectoryBlock {
             file_entries: [DirectoryFileEntry {
                 filename: [0u8; 56],
@@ -236,8 +240,12 @@ pub fn create_dir(file: &mut File, dir: &String) -> Result<u64, String> {
             file_inode_ptr: parent_folder,
         };
 
+        dbg!(&parent_folder);
+
         let mut parent_folder_inode = get_inode(file, parent_folder)?;
         
+        dbg!(&parent_folder_inode);
+
         parent_folder_inode.last_accessed = helpers::get_current_timestamp();
 
         match parent_folder_inode.subtype_info {
@@ -742,6 +750,8 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
                             // allows for more flexible allocation patterns in the future
 
                             let mut blocks_left_to_free = file_blocks;
+                            
+                            dbg!(&blocks_left_to_free);
 
                             for i in 0..(std::cmp::min(blocks_left_to_free, 8)) {
                                 set_blocks_used(file, superblock.blocks_ptr + direct_block_ptrs[i as usize] as u64 * BLOCK_SIZE as u64, 1, false)?;
@@ -749,10 +759,14 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
                                 blocks_left_to_free -= 1;
                             }
 
+                            dbg!(&blocks_left_to_free);
+
                             if indirect_ptr > 0 {
                                 let file_indirect_ptr = superblock.blocks_ptr + indirect_ptr as u64 * BLOCK_SIZE as u64;
 
-                                let block_blocks_left_to_free = blocks_left_to_free + 0x3FF / 0x400;
+                                let block_blocks_left_to_free = (blocks_left_to_free + 0x3FF) / 0x400;
+
+                                dbg!(&block_blocks_left_to_free);
                         
                                 let first_layer = get_file_struct::<FileFirstIndirectBlock, 0x1000>(file, file_indirect_ptr)?;
 
@@ -765,6 +779,7 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
                                         let block_ptr = second_layer.blocks[j as usize];
                                         let block_ptr = superblock.blocks_ptr + block_ptr as u64 * BLOCK_SIZE as u64;
 
+                                        dbg!(&block_ptr);
                                         set_blocks_used(file, block_ptr, 1, false)?;
                                     
                                         blocks_left_to_free -= 1;
@@ -797,7 +812,7 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
 
                     for j in 0..*item_count {
                         if j != i {
-                            new_file_entries.file_entries[j as usize] = parent_file_entries.file_entries[index];
+                            new_file_entries.file_entries[index] = parent_file_entries.file_entries[j as usize];
 
                             index += 1;
                         }
