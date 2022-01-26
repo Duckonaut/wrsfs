@@ -717,17 +717,16 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
                                     Ok(()) => (),
                                     Err(why) => return Err(format!("Couldn't write inode: {}", why)),
                                 }
-
-                                return Ok(())
                             }
+                            else {
+                                if item_count > 2 {
+                                    return Err(format!("Directory {} not empty!", filename));
+                                }
 
-                            if item_count > 2 {
-                                return Err(format!("Directory {} not empty!", filename));
+                                set_blocks_used(file, superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64, 1, false)?; 
+
+                                set_inode_used(file, item_inode_address, false)?;
                             }
-
-                            set_blocks_used(file, superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64, 1, false)?; 
-
-                            set_inode_used(file, item_inode_address, false)?;
                         },
                         INodeSubtype::File { size: _, direct_block_ptrs, indirect_ptr } => {
                             if item_inode.link_count > 1 {
@@ -740,58 +739,53 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
                                     Ok(()) => (),
                                     Err(why) => return Err(format!("Couldn't write inode: {}", why)),
                                 }
-
-                                return Ok(())
                             }
+                            else {
+                                let file_blocks = item_inode.get_blocks_used();
 
-                            let file_blocks = item_inode.get_blocks_used();
+                                // I could just clean it in a single block as it is, but cleaning it block by block
+                                // allows for more flexible allocation patterns in the future
 
-                            // I could just clean it in a single block as it is, but cleaning it block by block
-                            // allows for more flexible allocation patterns in the future
+                                let mut blocks_left_to_free = file_blocks;
+                                
+                                for i in 0..(std::cmp::min(blocks_left_to_free, 8)) {
+                                    set_blocks_used(file, superblock.blocks_ptr + direct_block_ptrs[i as usize] as u64 * BLOCK_SIZE as u64, 1, false)?;
 
-                            let mut blocks_left_to_free = file_blocks;
-                            
-                            dbg!(&blocks_left_to_free);
-
-                            for i in 0..(std::cmp::min(blocks_left_to_free, 8)) {
-                                set_blocks_used(file, superblock.blocks_ptr + direct_block_ptrs[i as usize] as u64 * BLOCK_SIZE as u64, 1, false)?;
-
-                                blocks_left_to_free -= 1;
-                            }
-
-                            dbg!(&blocks_left_to_free);
-
-                            if indirect_ptr > 0 {
-                                let file_indirect_ptr = superblock.blocks_ptr + indirect_ptr as u64 * BLOCK_SIZE as u64;
-
-                                let block_blocks_left_to_free = (blocks_left_to_free + 0x3FF) / 0x400;
-
-                                dbg!(&block_blocks_left_to_free);
-                        
-                                let first_layer = get_file_struct::<FileFirstIndirectBlock, 0x1000>(file, file_indirect_ptr)?;
-
-                                for i in 0..block_blocks_left_to_free {
-                                    let second_layer_indirect_ptr = first_layer.more_indirect_blocks[i as usize];
-                                    let second_layer_indirect_ptr = superblock.blocks_ptr + second_layer_indirect_ptr as u64 * BLOCK_SIZE as u64;
-                                    let second_layer = get_file_struct::<FileSecondIndirectBlock, 0x1000>(file, second_layer_indirect_ptr)?;
-
-                                    for j in 0..(std::cmp::min(blocks_left_to_free, 0x400)) {
-                                        let block_ptr = second_layer.blocks[j as usize];
-                                        let block_ptr = superblock.blocks_ptr + block_ptr as u64 * BLOCK_SIZE as u64;
-
-                                        dbg!(&block_ptr);
-                                        set_blocks_used(file, block_ptr, 1, false)?;
-                                    
-                                        blocks_left_to_free -= 1;
-                                    }
-
-                                    set_blocks_used(file, second_layer_indirect_ptr, 1, false)?;
+                                    blocks_left_to_free -= 1;
                                 }
 
-                                set_blocks_used(file, file_indirect_ptr, 1, false)?;
-                            }
+                                if indirect_ptr > 0 {
+                                    let file_indirect_ptr = superblock.blocks_ptr + indirect_ptr as u64 * BLOCK_SIZE as u64;
 
-                            set_inode_used(file, item_inode_address, false)?;
+                                    let block_blocks_left_to_free = (blocks_left_to_free + 0x3FF) / 0x400;
+
+                                    dbg!(&block_blocks_left_to_free);
+                            
+                                    let first_layer = get_file_struct::<FileFirstIndirectBlock, 0x1000>(file, file_indirect_ptr)?;
+
+                                    for i in 0..block_blocks_left_to_free {
+                                        let second_layer_indirect_ptr = first_layer.more_indirect_blocks[i as usize];
+                                        let second_layer_indirect_ptr = superblock.blocks_ptr + second_layer_indirect_ptr as u64 * BLOCK_SIZE as u64;
+                                        let second_layer = get_file_struct::<FileSecondIndirectBlock, 0x1000>(file, second_layer_indirect_ptr)?;
+
+                                        for j in 0..(std::cmp::min(blocks_left_to_free, 0x400)) {
+                                            let block_ptr = second_layer.blocks[j as usize];
+                                            let block_ptr = superblock.blocks_ptr + block_ptr as u64 * BLOCK_SIZE as u64;
+
+                                            dbg!(&block_ptr);
+                                            set_blocks_used(file, block_ptr, 1, false)?;
+                                        
+                                            blocks_left_to_free -= 1;
+                                        }
+
+                                        set_blocks_used(file, second_layer_indirect_ptr, 1, false)?;
+                                    }
+
+                                    set_blocks_used(file, file_indirect_ptr, 1, false)?;
+                                }
+
+                                set_inode_used(file, item_inode_address, false)?;
+                            }
                         },
                     };
 
@@ -850,6 +844,99 @@ pub fn remove(file: &mut File, dir: &String) -> Result<(), String> {
 
     Ok(())
 
+}
+
+pub fn create_link(img_file: &mut File, file: &String, link: &String) -> Result<(), String> {
+    let superblock = get_superblock(img_file)?;
+
+    let link_path = String::from(link.trim().trim_matches('/'));
+    let link_path_split = link_path.split('/').collect::<Vec<&str>>();
+
+    let linkname = match link_path_split.last() {
+        Some(v) => v.to_owned(),
+        None => return Err(format!("Cannot link file with empty name \"{}\".", link_path))
+    };
+
+    let parent_path = link_path_split[0..(link_path_split.len()-1)].join("/");
+
+    let parent_inode_address = if parent_path == "" {
+        superblock.inode_blocks_ptr
+    }
+    else {
+        match find_folder_inode(img_file, &parent_path)? {
+            Some(v) => v,
+            None => return Err(format!("Directory {} does not exist.", parent_path))
+        }
+    };
+
+    let linkname_vec: Vec<u8> = String::from(linkname).into_bytes();
+
+    let mut linkname_bytes = [0u8; 56];
+        
+    for i in 0..(std::cmp::min(linkname_vec.len(), 56)) {
+        linkname_bytes[i] = linkname_vec[i];
+    }
+
+    let mut dir_inode = get_inode(img_file, parent_inode_address)?;
+    
+    dir_inode.last_accessed = helpers::get_current_timestamp();
+
+    let inode_to_link_to_address = match find_folder_inode(img_file, file)? {
+        None => return Err(format!("Cannot link to {}: Doesn't exist", file)),
+        Some(v) => v
+    };
+
+    let mut inode_to_link_to = get_inode(img_file, inode_to_link_to_address)?;
+    
+    match dir_inode.subtype_info {
+        INodeSubtype::File { .. } => return Err(format!("{} is a file, not a directory.", &parent_path)),
+        INodeSubtype::Directory { ref mut item_count, inode_table_block } => {
+            let file_entry_address = superblock.blocks_ptr + inode_table_block as u64 * BLOCK_SIZE as u64;
+
+            let mut parent_file_entries = get_file_struct::<DirectoryBlock, 0x1000>(img_file, file_entry_address)?;
+            
+            for entry in parent_file_entries.file_entries {
+                if entry.filename == linkname_bytes {
+                    return Err(format!("Directory/file {} already exists in {}", &linkname, parent_path));
+                }
+            }
+
+            parent_file_entries.file_entries[*item_count as usize] = DirectoryFileEntry {
+                filename: linkname_bytes,
+                file_inode_ptr: inode_to_link_to_address
+            };
+
+            inode_to_link_to.link_count += 1;
+
+            match img_file.write_all_at(&(match bincode::serialize(&inode_to_link_to) {
+                    Ok(b) => b,
+                    Err(why) => return Err(format!("Couldn't serialize updated inode: {}", why))
+                }), inode_to_link_to_address) {
+                Ok(()) => (),
+                Err(why) => return Err(format!("Couldn't write updated inode: {}", why)),
+            }
+
+            *item_count += 1;
+                
+            match img_file.write_all_at(&(match bincode::serialize(&parent_file_entries) {
+                    Ok(b) => b,
+                    Err(why) => return Err(format!("Couldn't serialize dir block: {}", why))
+                }), file_entry_address) {
+                Ok(()) => (),
+                Err(why) => return Err(format!("Couldn't write dir block: {}", why)),
+            }
+        },
+    }
+
+    match img_file.write_all_at(&(match bincode::serialize(&dir_inode) {
+            Ok(b) => b,
+            Err(why) => return Err(format!("Couldn't serialize directory inode: {}", why))
+        }), parent_inode_address) {
+        Ok(()) => (),
+        Err(why) => return Err(format!("Couldn't write directory inode: {}", why)),
+    }
+
+    Ok(())
 }
 
 /// Lists directory <dir> in virtual disk <file> content along with basic info about members

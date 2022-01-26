@@ -1,7 +1,7 @@
 use std::{path::PathBuf, fs::OpenOptions};
 
 use structopt::StructOpt;
-use wrsfs::{create_dir, list, copy_file, get_file, remove};
+use wrsfs::{create_dir, list, copy_file, get_file, remove, create_link};
 
 mod wrsfs;
 mod types;
@@ -32,6 +32,11 @@ enum Args {
         imgname: PathBuf,
         itemname: String
     },
+    Link {
+        imgname: PathBuf,
+        file: String,
+        link: String
+    },
     Ls {
         imgname: PathBuf,
         #[structopt(default_value = "/")]
@@ -56,6 +61,7 @@ fn main() {
         Args::Cp { imgname, filename, target_filename } => cp(imgname, filename, target_filename),
         Args::Get { imgname, filename, target_filename } => get(imgname, filename, target_filename),
         Args::Rm { imgname, itemname } => rm(imgname, itemname),
+        Args::Link { imgname, file, link: link_name } => link(imgname, file, link_name),
         Args::Ls { imgname, dir } => ls(imgname, dir),
         Args::Info { imgname, usage, pointers } => info(imgname, usage, pointers),
         Args::Debug => debug(),
@@ -158,6 +164,24 @@ fn rm(imgname: PathBuf, itemname: String) {
     match remove(&mut img_file, &itemname) {
         Ok(()) => println!("Removed item {}", &itemname),
         Err(why) => println!("Failed to remove item: {}", why)
+    }
+
+}
+
+fn link(imgname: PathBuf, file: String, link: String) {
+    let img_path = imgname.as_path();
+
+    let mut img_file = match OpenOptions::new().read(true).write(true).open(img_path) {
+        Ok(v) => v,
+        Err(why) => { 
+            println!("Couldn't open image {}: {}", img_path.to_str().unwrap(), why);
+            return;
+        }
+    };
+    
+    match create_link(&mut img_file, &file, &link) {
+        Ok(()) => println!("Linked item {} to {}", &file, &link),
+        Err(why) => println!("Failed to link item: {}", why)
     }
 
 }
